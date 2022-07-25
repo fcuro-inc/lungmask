@@ -20,10 +20,16 @@ model_urls = {('unet', 'R231'): ('https://github.com/JoHof/lungmask/releases/dow
 
 
 def apply(image, model=None, force_cpu=False, batch_size=20, volume_postprocessing=True, noHU=False):
+    resolver = apply_async(image, model, force_cpu, batch_size, volume_postprocessing, noHU)
+    return resolver.resolve()
+
+
+def apply_async(image, model=None, force_cpu=False, batch_size=20, volume_postprocessing=True, noHU=False):
     if model is None:
         model = get_model('unet', 'R231')
     
     numpy_mode = isinstance(image, np.ndarray)
+    directions = None
     if numpy_mode:
         inimg_raw = image.copy()
     else:
@@ -44,7 +50,8 @@ def apply(image, model=None, force_cpu=False, batch_size=20, volume_postprocessi
             device = torch.device('cpu')
     model.to(device)
 
-    
+    tvolslices = None
+    xnew_box = None
     if not noHU:
         tvolslices, xnew_box = utils.preprocess(inimg_raw, resolution=[256, 256])
         tvolslices[tvolslices > 600] = 600
@@ -58,37 +65,51 @@ def apply(image, model=None, force_cpu=False, batch_size=20, volume_postprocessi
         sanity = [(tvolslices[x]>0.6).sum()>25000 for x in range(len(tvolslices))]
         tvolslices = tvolslices[sanity]
     torch_ds_val = utils.LungLabelsDS_inf(tvolslices)
-    dataloader_val = torch.utils.data.DataLoader(torch_ds_val, batch_size=batch_size, shuffle=False, num_workers=0,
+    dataloader_val = torch.utils.data.DataLoader(torch_ds_val, batch_size=batch_size, shuffle=False, num_workers=1,
                                                  pin_memory=False)
 
-    timage_res = np.empty((np.append(0, tvolslices[0].shape)), dtype=np.uint8)
-
+    res = []
     with torch.no_grad():
         for X in dataloader_val:
             X = X.float().to(device)
             prediction = model(X)
-            pls = torch.max(prediction, 1)[1].detach().cpu().numpy().astype(np.uint8)
-            timage_res = np.vstack((timage_res, pls))
+            res.append(torch.max(prediction, 1)[1])
 
-    # postprocessing includes removal of small connected components, hole filling and mapping of small components to
-    # neighbors
-    if volume_postprocessing:
-        outmask = utils.postrocessing(timage_res)
-    else:
-        outmask = timage_res
+    return MaskAsyncResolver(res, volume_postprocessing, numpy_mode, inimg_raw, tvolslices[0].shape, xnew_box, directions)
 
-    if noHU:
-        outmask = skimage.transform.resize(outmask[np.argmax((outmask==1).sum(axis=(1,2)))], inimg_raw.shape[:2], order=0, anti_aliasing=False, preserve_range=True)[None,:,:]
-    else:
-         outmask = np.asarray(
-            [utils.reshape_mask(outmask[i], xnew_box[i], inimg_raw.shape[1:]) for i in range(outmask.shape[0])],
+
+class MaskAsyncResolver(object):
+
+    def __init__(self, results , volume_postprocessing: bool, numpy_mode: bool, inimg_raw, shape, xnew_box, directions):
+        self.results = results
+        self.volume_postprocessing = volume_postprocessing
+        self.numpy_mode = numpy_mode
+        self.shape = shape
+        self.xnew_box = xnew_box
+        self.inimg_raw = inimg_raw
+        self.directions = directions
+
+    def resolve(self):
+        timage_res = np.empty((np.append(0, self.shape)), dtype=np.uint8)
+
+        with torch.no_grad():
+            for res in self.results:
+                pls = res.detach().cpu().numpy().astype(np.uint8)
+                timage_res = np.vstack((timage_res, pls))
+
+        if self.volume_postprocessing:
+            outmask = utils.postrocessing(timage_res)
+        else:
+            outmask = timage_res
+
+        outmask = np.asarray(
+            [utils.reshape_mask(outmask[i], self.xnew_box[i], self.inimg_raw.shape[1:])
+            for i in range(outmask.shape[0])],
             dtype=np.uint8)
-    
-    if not numpy_mode:
-        if len(directions) == 9:
-            outmask = np.flip(outmask, np.where(directions[[0,4,8]][::-1]<0)[0])    
-    
-    return outmask.astype(np.uint8)
+        if not self.numpy_mode:
+            if len(self.directions) == 9:
+                outmask = np.flip(outmask, np.where(self.directions[[0, 4, 8]][::-1] < 0)[0])
+        return outmask.astype(np.uint8)
 
 
 def get_model(modeltype, modelname, modelpath=None, n_classes=3):
