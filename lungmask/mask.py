@@ -65,7 +65,7 @@ def apply_async(image, model=None, force_cpu=False, batch_size=20, volume_postpr
         sanity = [(tvolslices[x]>0.6).sum()>25000 for x in range(len(tvolslices))]
         tvolslices = tvolslices[sanity]
     torch_ds_val = utils.LungLabelsDS_inf(tvolslices)
-    dataloader_val = torch.utils.data.DataLoader(torch_ds_val, batch_size=batch_size, shuffle=False, num_workers=1,
+    dataloader_val = torch.utils.data.DataLoader(torch_ds_val, batch_size=batch_size, shuffle=False, num_workers=0,
                                                  pin_memory=False)
 
     res = []
